@@ -38,6 +38,12 @@ type Config struct {
 	BeaconPort uint16
 	QueryPort  uint16
 	AllowTTL   time.Duration
+	// BlockSet is the deny-set name. Unlike the allow-set it also covers the
+	// BEACON port: the beacon crash arrives from a peer that has not yet
+	// authenticated, so the allow-list cannot reach it — a named attacker can.
+	BlockSet string
+	// BanTTL is how long a blocked IP stays blocked. Zero means 24h.
+	BanTTL time.Duration
 
 	// LogDropped puts the source address of dropped packets into the kernel log.
 	// Off by default: it is the one path where an attacker controls how much you
@@ -52,6 +58,7 @@ type Firewall struct {
 	conn  *nftables.Conn
 	table *nftables.Table
 	set   *nftables.Set
+	block *nftables.Set
 	// dropRule is retained so Disable() can delete precisely what Enable() added
 	// and so DropCount() can read its counter. The log rule needs no handle: it
 	// goes away with the chain.
@@ -85,6 +92,17 @@ func (f *Firewall) EnsureTableAndSet() error {
 	}
 	if err := f.conn.AddSet(f.set, nil); err != nil {
 		return fmt.Errorf("add set: %w", err)
+	}
+
+	f.block = &nftables.Set{
+		Table:      f.table,
+		Name:       f.cfg.BlockSet,
+		KeyType:    nftables.TypeIPAddr,
+		HasTimeout: true,
+		Timeout:    f.banTTL(),
+	}
+	if err := f.conn.AddSet(f.block, nil); err != nil {
+		return fmt.Errorf("add block set: %w", err)
 	}
 	return f.conn.Flush()
 }
@@ -121,12 +139,54 @@ func (f *Firewall) Revoke(ip netip.Addr) error {
 	return f.conn.Flush()
 }
 
+func (f *Firewall) banTTL() time.Duration {
+	if f.cfg.BanTTL <= 0 {
+		return 24 * time.Hour
+	}
+	return f.cfg.BanTTL
+}
+
+// Block adds ip to the deny-set: dropped on the beacon port as well as the game
+// port, for BanTTL. This is the only lever guardian has against an attacker who
+// crashes the server THROUGH the beacon handshake — that port must stay open to
+// the world for players to authenticate, so the only thing left is to name the
+// source afterwards and keep it out of the next attempt.
+//
+// The ban expires. A permanent one belongs in your admin list against the EOS
+// id: addresses get reassigned, and a stale permanent drop is a locked-out
+// player nobody remembers blocking.
+func (f *Firewall) Block(ip netip.Addr) error {
+	if !ip.Is4() {
+		return fmt.Errorf("non-ipv4 address not supported: %s", ip)
+	}
+	v4 := ip.As4()
+	if err := f.conn.SetAddElements(f.block, []nftables.SetElement{
+		{Key: v4[:], Timeout: f.banTTL()},
+	}); err != nil {
+		return fmt.Errorf("block %s: %w", ip, err)
+	}
+	return f.conn.Flush()
+}
+
+// Unblock removes a ban early (admin correction of a false positive).
+func (f *Firewall) Unblock(ip netip.Addr) error {
+	if !ip.Is4() {
+		return fmt.Errorf("non-ipv4 address not supported: %s", ip)
+	}
+	v4 := ip.As4()
+	if err := f.conn.SetDeleteElements(f.block, []nftables.SetElement{{Key: v4[:]}}); err != nil {
+		return fmt.Errorf("unblock %s: %w", ip, err)
+	}
+	return f.conn.Flush()
+}
+
 // Enable installs the gating chain and drop rule. After this, game-port traffic
 // from IPs not in the allow-set is dropped. Beacon and query ports are accepted
 // unconditionally so players can always authenticate.
 //
 // Chain layout (inet family, input hook):
 //
+//	udp dport {beacon,game} ip saddr @blocked  drop
 //	udp dport {beacon,query}                accept
 //	udp dport game  ip saddr @allowed       accept
 //	udp dport game                          drop   <-- retained as f.dropRule
@@ -140,6 +200,11 @@ func (f *Firewall) Enable() error {
 		Policy:   &policyAccept,                  // fail-open default: an empty/half-built chain accepts
 	})
 
+	// drop named attackers first, on the beacon port too — the allow-list cannot
+	// gate the beacon port, so this is the only rule that reaches a beacon-side
+	// attack. Must come before the accepts or the accept wins.
+	f.dropIfBlocked(chain, f.cfg.BeaconPort)
+	f.dropIfBlocked(chain, f.cfg.GamePort)
 	// accept beacon
 	f.acceptUDPPort(chain, f.cfg.BeaconPort)
 	// accept query
@@ -189,6 +254,17 @@ func (f *Firewall) acceptUDPPort(chain *nftables.Chain, port uint16) {
 		Chain: chain,
 		Exprs: append(matchUDPDport(port), &expr.Verdict{Kind: expr.VerdictAccept}),
 	})
+}
+
+// dropIfBlocked drops traffic to port from any source in the deny-set.
+func (f *Firewall) dropIfBlocked(chain *nftables.Chain, port uint16) {
+	exprs := matchUDPDport(port)
+	exprs = append(exprs,
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+		&expr.Lookup{SourceRegister: 1, SetName: f.cfg.BlockSet, SetID: f.block.ID},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	)
+	f.conn.AddRule(&nftables.Rule{Table: f.table, Chain: chain, Exprs: exprs})
 }
 
 func (f *Firewall) acceptGameIfAllowed(chain *nftables.Chain) {

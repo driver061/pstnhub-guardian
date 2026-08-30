@@ -110,6 +110,7 @@ func run(cfg *config.Config, log *slog.Logger) error {
 		fw, err := firewall.New(firewall.Config{
 			Table:      s.NFTable,
 			Set:        s.NFSet,
+			BlockSet:   s.NFSet + "_blocked",
 			GamePort:   s.GamePort,
 			BeaconPort: s.BeaconPort,
 			QueryPort:  s.QueryPort,
@@ -140,6 +141,12 @@ func run(cfg *config.Config, log *slog.Logger) error {
 		} else {
 			g.Seed(seeded)
 			log.Info("seeded allow-list from state", "count", len(seeded))
+		}
+		if bans, err := gate.LoadState(banPath(cfg.StateDir, s.Name)); err != nil {
+			log.Warn("could not load persisted bans", "err", err)
+		} else if len(bans) > 0 {
+			g.SeedBans(bans)
+			log.Warn("restored bans from state", "count", len(bans))
 		}
 
 		if enforce {
@@ -178,6 +185,7 @@ func runServer(ctx context.Context, stop context.CancelFunc, s config.Server, cf
 	g *gate.Gate, fw *firewall.Firewall, notif *notifier.Notifier, log *slog.Logger) {
 
 	statePath := filepath.Join(cfg.StateDir, s.Name+".json")
+	bans := banPath(cfg.StateDir, s.Name)
 
 	lines := make(chan string, 1024)
 	tl := tailer.New(s.LogPath)
@@ -212,17 +220,32 @@ func runServer(ctx context.Context, stop context.CancelFunc, s config.Server, cf
 	saveTicker := time.NewTicker(30 * time.Second)
 	defer saveTicker.Stop()
 
+	// The stall detector is the one check that has to run on OUR clock: it fires
+	// on a beacon connection that has gone silent, so waiting for the next log
+	// line to drive it defeats the point. 500ms keeps the detection lag well
+	// inside the 2s window.
+	stallTicker := time.NewTicker(500 * time.Millisecond)
+	defer stallTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			if err := gate.SaveState(statePath, g.Snapshot()); err != nil {
 				log.Warn("final state save failed", "err", err)
 			}
+			if err := gate.SaveState(bans, g.Bans()); err != nil {
+				log.Warn("final ban save failed", "err", err)
+			}
 			return
 		case <-saveTicker.C:
 			if err := gate.SaveState(statePath, g.Snapshot()); err != nil {
 				log.Warn("state save failed", "err", err)
 			}
+			if err := gate.SaveState(bans, g.Bans()); err != nil {
+				log.Warn("ban save failed", "err", err)
+			}
+		case <-stallTicker.C:
+			g.SweepStalls()
 		case line := <-lines:
 			if ev, ok := parser.Parse(line); ok {
 				g.Handle(ev)
@@ -299,3 +322,8 @@ func heartbeat(ctx context.Context, interval time.Duration, log *slog.Logger) {
 		}
 	}
 }
+
+// banPath is the ban file for a server. Separate from the allow-list file: bans
+// must survive the crash that caused them, and mixing them into the same file
+// risks one bad write losing both.
+func banPath(dir, name string) string { return filepath.Join(dir, name+".bans.json") }

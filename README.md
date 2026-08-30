@@ -89,6 +89,73 @@ Two hardening notes, both from the August 2026 exploit that authenticates first:
   reason. The alert carries the EOS id that IP beaconed with — that is what you
   permaban, since the address rotates and the account does not.
 
+### The beacon port is still open, and that is where the crash moved
+
+The August 2026 variant crashes the server through the **beacon** handshake
+itself: an unauthenticated peer (`Def:BeaconNetDriver ... UniqueId: INVALID`)
+gets to `Beacon Hello` and the process takes a SIGSEGV. Guardian cannot firewall
+that away — the beacon port is where players go to *become* allow-listed, so it
+must stay open to the world. **Guardian does not prevent the first crash.**
+
+What it does instead: `LogCore: === Critical error:` triggers attribution. The
+unauthenticated beacon peer seen within 15 seconds of the fatal error is banned
+for 24h in a second nftables set (`<nft_set>_blocked`) that drops it on the
+beacon port as well as the game port, and the ban is persisted to
+`<state_dir>/<server>.bans.json` so it survives the restart the crash causes.
+
+### The stall detector
+
+The one check that fires *before* the crash. A beacon connection that reaches
+`LogBeacon: ... Beacon Hello` and then does not speak the beacon protocol
+(`Client netspeed`, `Beacon Join`, `Handshake complete`) within 2 seconds is
+banned.
+
+Everything before `Beacon Hello` is the engine talking to itself, so an attacker
+is indistinguishable from a player up to that point. The first thing a *client*
+sends is `Client netspeed`, in the same millisecond. The observed attack never
+sends it.
+
+Measured on four crash captures (291k lines, 7.7k parsed events, 1020 beacon
+handshakes):
+
+| Log | Bans | Who |
+|---|---|---|
+| 08-29 19:11 | 0 | crash arrived on the game driver |
+| 08-29 19:30 | 1 | `91.231.66.26` — probed 19 min before the kill |
+| 08-30 13:00 | 0 | crash arrived on the game driver |
+| 08-30 15:59 | 1 | `85.203.39.233` — the IP that crashed it |
+
+Zero players banned. Reproduce with:
+
+```
+GUARDIAN_REPLAY_LOG=/path/to/SquadGame.log go test ./internal/gate -run Replay -v
+```
+
+Two things it does not do. It cannot stop a first-ever single shot — the payload
+lands in the same 81ms as the `Beacon Hello`, so there is nothing to be early
+about. And when the attacker rotates address between probe and kill (the 19:30
+case) the ban lands on an address they have already abandoned.
+
+The sweep runs on a 500ms ticker against wall time, not off the log stream. That
+is not an optimisation: the attacker's whole trick is going silent, and a sweep
+driven by log lines cannot fire while nothing is being logged. Replaying the
+15:59 capture with the log clock alone banned 128ms before the crash instead of
+1.5s before it.
+
+### Crash attribution alerts, and does not ban
+
+`LogCore: === Critical error:` names the nearest unauthenticated beacon peer in
+an alert and stops there. It used to ban. Replay showed that in two of the four
+crashes the nearest peer was an ordinary player mid-join, because the payload
+had actually arrived on the game driver — a 24h ban on a bystander is worse than
+no ban.
+
+This is a heuristic and it can be wrong. The alert names the suspect, its
+connection count, and how many other candidates were in the window; an admin who
+disagrees clears the entry (`nft delete element inet <table> <set>_blocked { ip }`).
+Bans expire on their own after 24h — a permanent one belongs in the admin list
+against the EOS id.
+
 ### What the firewall actually installs
 
 Per server, one table containing one set and one chain:

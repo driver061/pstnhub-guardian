@@ -33,13 +33,23 @@ const (
 	KindBeaconAuthed      // an IP completed the beacon handshake (allow it)
 	KindGameAccepted      // a game-driver connection was accepted (log-only interest)
 	KindExploit           // the crash exploit's own footprint (revoke the IP)
+	KindBeaconUnauth      // a beacon connection accepted with an unresolved id (suspect)
+	KindCrash             // the server hit a fatal error (blame the last suspect)
+	KindBeaconConn        // a beacon connection object was created (binds conn name -> IP)
+	KindBeaconHello       // that connection reached "Beacon Hello"
+	KindBeaconSpoke       // that connection then spoke the beacon protocol (it is a client)
 )
 
 type Event struct {
 	Kind  Kind
 	IP    netip.Addr
 	EOSID string // populated for KindBeaconAuthed
-	Raw   string
+	// Conn is the UNetConnection object name, e.g. RedpointEOSIpNetConnection_21.
+	// Set on the three beacon-progress kinds. The LogBeacon lines identify a
+	// connection ONLY by this name — no address — so the conn->IP binding from
+	// KindBeaconConn is the only way to attribute them.
+	Conn string
+	Raw  string
 
 	// At is the timestamp from the line's own [YYYY.MM.DD-HH.MM.SS:mmm] prefix,
 	// zero if the line has none. Startup backfill needs it to age replayed
@@ -91,6 +101,39 @@ var reExploit = regexp.MustCompile(
 	`^\[[0-9.\-:]+\]\[[ 0-9]+\]LogSecurity: Warning: (\d{1,3}(?:\.\d{1,3}){3}):\d+: Closed:`,
 )
 
+// A beacon-driver connection ACCEPTED with an unresolved id. On its own this is
+// completely normal — every player looks like this until the EOS handshake
+// resolves, which is why it can never ban by itself. It is recorded only so a
+// fatal error seconds later has a suspect: the beacon port cannot be gated by
+// the allow-list (it is where you go to GET allow-listed), so an attacker
+// crashing the server through it is invisible to the firewall until named.
+var reBeaconUnauth = regexp.MustCompile(
+	logNet + `NotifyAcceptedConnection:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Def:BeaconNetDriver.*UniqueId:\s*INVALID`,
+)
+
+// The server dying. Unreal writes this immediately before the callstack.
+var reCrash = regexp.MustCompile(`LogCore: (=== Critical error:|Fatal error!)`)
+
+// The three lines that track how far a beacon connection got. The observed
+// attack completes the engine's transport handshake and then never speaks the
+// beacon protocol at all: it reaches "Beacon Hello" and stops. Across four crash
+// logs, 1020 beacon handshakes produced exactly 4 connections that stalled
+// there, and all 4 were the attacker — every real client, including ones that
+// drop out moments later, sends "Client netspeed" first.
+//
+// LogBeacon lines carry the connection object name and no address, hence the
+// separate binding line.
+var reBeaconConn = regexp.MustCompile(
+	logNet + `AddClientConnection:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+,\s*Name:\s*(\w+),.*Def:BeaconNetDriver`,
+)
+
+var reBeaconHello = regexp.MustCompile(`LogBeacon: .*\[(\w+)\]: Beacon Hello`)
+
+// Client netspeed is the FIRST thing a real beacon client sends. Anything later
+// in the sequence (Beacon Join, Handshake complete) also proves it, but netspeed
+// is the earliest, so it is the one worth waiting for.
+var reBeaconSpoke = regexp.MustCompile(`LogBeacon: .*\[(\w+)\]: (Client netspeed|Beacon Join|Handshake complete)`)
+
 // A beacon-driver close that carries a resolved EOS id. The EOS id proves the
 // connection authenticated; INVALID lines are deliberately NOT matched.
 var reBeaconAuthed = regexp.MustCompile(
@@ -107,6 +150,25 @@ func Parse(line string) (Event, bool) {
 	if m := reExploit.FindStringSubmatch(line); m != nil {
 		if ip, err := netip.ParseAddr(m[1]); err == nil {
 			return Event{Kind: KindExploit, IP: ip, Raw: line, At: stampOf(line)}, true
+		}
+	}
+	if m := reBeaconSpoke.FindStringSubmatch(line); m != nil {
+		return Event{Kind: KindBeaconSpoke, Conn: m[1], Raw: line, At: stampOf(line)}, true
+	}
+	if m := reBeaconHello.FindStringSubmatch(line); m != nil {
+		return Event{Kind: KindBeaconHello, Conn: m[1], Raw: line, At: stampOf(line)}, true
+	}
+	if m := reBeaconConn.FindStringSubmatch(line); m != nil {
+		if ip, err := netip.ParseAddr(m[1]); err == nil {
+			return Event{Kind: KindBeaconConn, IP: ip, Conn: m[2], Raw: line, At: stampOf(line)}, true
+		}
+	}
+	if reCrash.MatchString(line) {
+		return Event{Kind: KindCrash, Raw: line, At: stampOf(line)}, true
+	}
+	if m := reBeaconUnauth.FindStringSubmatch(line); m != nil {
+		if ip, err := netip.ParseAddr(m[1]); err == nil {
+			return Event{Kind: KindBeaconUnauth, IP: ip, Raw: line, At: stampOf(line)}, true
 		}
 	}
 	if m := reGameAccepted.FindStringSubmatch(line); m != nil {

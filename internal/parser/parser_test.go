@@ -35,4 +35,17 @@ func TestParse(t *testing.T) {
 	if ev, ok := Parse(forged); ok {
 		t.Fatalf("forged in-line beacon must not match: %+v", ev)
 	}
+
+	// Beacon-side crash: peer never resolves an id, server dies mid-handshake.
+	unauth := `[2026.08.30-15.59.32:699][415]LogNet: NotifyAcceptedConnection: Name: OnlineBeaconHost_2146070702, TimeStamp: 08/30/26 18:59:32, [UNetConnection] RemoteAddr: 85.203.39.233:30724, Name: RedpointEOSIpNetConnection_2145927704, Driver: Name:RedpointEOSNetDriver_2146070701 Def:BeaconNetDriver RedpointEOSNetDriver_2146070701, IsServer: YES, PC: NULL, Owner: NULL, UniqueId: INVALID`
+	if ev, ok := Parse(unauth); !ok || ev.Kind != KindBeaconUnauth || ev.IP.String() != "85.203.39.233" {
+		t.Fatalf("beacon unauth: %+v ok=%v", ev, ok)
+	}
+	if ev, ok := Parse(`[2026.08.30-15.59.32:827][422]LogCore: === Critical error: ===`); !ok || ev.Kind != KindCrash {
+		t.Fatalf("crash: %+v ok=%v", ev, ok)
+	}
+	// An authed beacon close must still win over the unauth pattern.
+	if ev, _ := Parse(beacon); ev.Kind != KindBeaconAuthed {
+		t.Fatalf("authed beacon misclassified: %+v", ev)
+	}
 }
