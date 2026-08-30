@@ -1,0 +1,69 @@
+# Template unit: one instance per Squad server.
+#
+#   systemctl enable --now squad-gatekeeper@main
+#   systemctl enable --now squad-gatekeeper@server2
+#
+# %i is the instance name. Each instance reads its OWN config from
+# <repo>/%i.env — ports, log path, nftables table, webhook.
+# Instances MUST NOT share an nftables table name (NFT_TABLE); see the example env.
+[Unit]
+Description=Squad game-port gatekeeper (beacon-auth allow-list) [%i]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# --- least privilege --------------------------------------------------------
+# CAP_NET_ADMIN is required to modify nftables over netlink. Do NOT run as root;
+# run as a dedicated unprivileged user with only this capability.
+User=squad-gatekeeper
+Group=squad-gatekeeper
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# --- per-instance config ----------------------------------------------------
+# All per-server settings live here: DISCORD_WEBHOOK_URL (secret), NFT_TABLE, and
+# GATEKEEPER_ARGS (ports + log path). Mode 0600, owned by the service user.
+# Everything lives in the checkout, not /etc and /var/lib. Change these paths
+# together if you move the repo — systemd cannot derive them the way run.sh does.
+# The env file holds a secret and sits in a git checkout: keep *.env gitignored.
+WorkingDirectory=/home/user/squad/PSTN/git/pstnhub-guardian
+EnvironmentFile=/home/user/squad/PSTN/git/pstnhub-guardian/%i.env
+# StateDirectory= only makes /var/lib dirs, so make ours by hand.
+ExecStartPre=/bin/mkdir -p /home/user/squad/PSTN/git/pstnhub-guardian/state/%i
+# $GATEKEEPER_ARGS is deliberately unquoted: systemd word-splits it into flags.
+ExecStart=/home/user/squad/PSTN/git/pstnhub-guardian/pstnhub-guardian \
+    -nft-table ${NFT_TABLE} \
+    -state /home/user/squad/PSTN/git/pstnhub-guardian/state/%i/allow.json \
+    $GATEKEEPER_ARGS
+# NOTE: -enforce belongs in GATEKEEPER_ARGS, and only after a clean log-only week.
+
+# --- fail-open on abrupt death ----------------------------------------------
+# Runs even on SIGKILL/OOM where the process defers cannot. Removes the whole
+# gating chain, reverting the game port to accept-all. `-` prefixes ignore errors
+# (e.g. table already gone). Requires the nft binary present as a backstop path
+# that does not depend on the daemon being alive.
+ExecStopPost=-/usr/sbin/nft delete chain inet ${NFT_TABLE} input
+ExecStopPost=-/bin/sh -c 'logger -t squad-gatekeeper "fail-open: gating chain removed on stop (%i)"'
+
+# --- watchdog ---------------------------------------------------------------
+# The daemon sends WATCHDOG=1 every ~10s (see -heartbeat). If it stops, systemd
+# kills and restarts, and ExecStopPost fires -> fail-open.
+WatchdogSec=30
+Restart=always
+RestartSec=2
+
+# --- hardening --------------------------------------------------------------
+# State lives in the checkout under /home, so ProtectHome must be off and the
+# repo explicitly writable — ProtectSystem=strict makes everything else read-only.
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/user/squad/PSTN/git/pstnhub-guardian
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

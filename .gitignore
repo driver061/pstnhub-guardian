@@ -1,0 +1,7 @@
+# Per-instance config holds DISCORD_WEBHOOK_URL. Never commit it.
+*.env
+!deploy/example.env
+
+# Runtime allow-list state and the built binary.
+state/
+/pstnhub-guardian
