@@ -1,4 +1,4 @@
-module github.com/yourorg/squad-gatekeeper
+module github.com/pstnhub/pstnhub-guardian
 
 go 1.26.2
 
@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect

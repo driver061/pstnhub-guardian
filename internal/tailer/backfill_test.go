@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/squad-gatekeeper/internal/parser"
+	"github.com/pstnhub/pstnhub-guardian/internal/parser"
 )
 
 func beacon(ts, ip, eos string) string {

@@ -2,7 +2,7 @@
 // firewall critical path: alerts flow through a buffered channel drained by one
 // goroutine, and if the buffer fills we DROP ALERTS, never block the caller.
 // Discord being slow, rate-limited, or down must degrade to "no alerts", never to
-// "the gatekeeper stalled".
+// "the guardian stalled".
 //
 // Aggregation: the attacker opens connections in bursts. One webhook per dropped
 // connection would flood the channel and trip Discord's ~30/min limit exactly when
@@ -47,8 +47,8 @@ type Notifier struct {
 
 	in chan Alert
 
-	mu     sync.Mutex
-	agg    map[netip.Addr]*aggState // per-IP incident aggregation
+	mu  sync.Mutex
+	agg map[netip.Addr]*aggState // per-IP incident aggregation
 }
 
 type aggState struct {

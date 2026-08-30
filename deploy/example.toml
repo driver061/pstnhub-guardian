@@ -1,0 +1,103 @@
+# pstnhub-guardian configuration.
+#
+# Copy to the repo root as guardian.toml. One file describes every server this
+# daemon gates; one process runs them all.
+#
+#   cp deploy/example.toml guardian.toml
+#   $EDITOR guardian.toml
+#
+# The Discord webhook is NOT in this file. It comes from DISCORD_WEBHOOK_URL in
+# the environment (see deploy/guardian.env), because anything passed as a flag is
+# visible in `ps` to every user on the box.
+
+# --- global switches ---------------------------------------------------------
+
+# The master enforcement switch. false = log-only: nothing is ever dropped, the
+# daemon only reports what it WOULD have dropped. Run this way for at least a
+# week and confirm no real player appears in the would-drop list.
+#
+# Setting this to false reverts every server at once — it is the panic button.
+# A server may opt OUT individually (see enforce under [[server]]), but no server
+# can opt IN while this is false.
+enforce = false
+
+# How long an authenticated IP stays allowed. The kernel expires set entries, so
+# this is not a timer the daemon has to get right. A player who idles longer than
+# this without re-beaconing is re-checked on their next connection.
+allow_ttl = "60m"
+
+# Per-source alert aggregation. The first drop from an IP alerts immediately,
+# then further drops from that IP are counted and flushed as one summary when the
+# window closes. Keeps an attack from becoming an alert flood.
+notify_cooldown = "5m"
+
+# systemd watchdog ping interval. Keep comfortably below WatchdogSec in the unit
+# file (30s there, so 10s here).
+heartbeat_interval = "10s"
+
+# Where per-server allow-lists are persisted, relative to the working directory.
+# Survives restarts so reconnecting players are not treated as strangers.
+state_dir = "state"
+
+# debug, info, warn, error.
+log_level = "info"
+
+# Write the source address of every dropped packet to the KERNEL log, readable
+# with `journalctl -k`. Useful for cross-referencing attackers with other hosts.
+#
+# Off by default because it is the only path where an attacker controls how much
+# you write to disk. log_drop_rate caps that, and the logging rule is deliberately
+# SEPARATE from the drop rule — exceeding the rate stops the logging, never the
+# dropping — but the safest volume is still none. Turn it on when you want the
+# addresses, off when you do not.
+log_dropped_ips = false
+
+# Per-second ceiling on those log lines. This makes the record a SAMPLE, not a
+# census: good for identifying sources, useless for counting packets. Use the
+# drop counter (reported to Discord and the journal) for volume.
+log_drop_rate = 10
+
+# --- servers -----------------------------------------------------------------
+#
+# One [[server]] block per Squad server. Repeat the block as many times as needed.
+#
+# CONFIRM THE PORTS FIRST — the values below are placeholders:
+#   ss -ulpn | grep SquadGame
+#
+# Only game_port is gated. beacon_port and query_port are always accepted: the
+# beacon is how a player proves they are real, so gating it would break the only
+# path onto the allow-list.
+
+[[server]]
+# Identifies this server in logs ([Gate:main]), in Discord alerts, and in the
+# name of its state file. Must be unique and filesystem-safe.
+name = "main"
+
+# A pattern SEED, not a fixed file. .../SquadGame.log also follows SquadGame_2.log
+# and switches automatically when Squad starts writing a new one. Rotated
+# (-backup-) and CRC logs are deliberately never followed — they are dead files,
+# and replaying them would re-allow players who left hours ago.
+log_path = "/home/user/squad/PSTN/servers/SquadServer1/SquadGame/Saved/Logs/SquadGame.log"
+
+game_port = 7787
+beacon_port = 15000
+query_port = 27165
+
+# Optional. Defaults to "squad_<name>". MUST be unique per server — two servers
+# sharing a table fight over the same chain and one ends up gating the other's
+# port. The loader refuses to start if two servers collide here.
+# nft_table = "squad_main"
+
+# Optional per-server opt-out. Omitted = follow the global switch. Set false to
+# keep this one server in log-only while the others enforce — useful when adding
+# a new server to an already-enforcing box.
+# enforce = false
+
+# A second server: same shape, different name, different ports, different table.
+#
+# [[server]]
+# name = "server2"
+# log_path = "/home/user/squad/PSTN/servers/SquadServer2/SquadGame/Saved/Logs/SquadGame.log"
+# game_port = 7797
+# beacon_port = 15001
+# query_port = 27166

@@ -1,0 +1,70 @@
+# pstnhub-guardian — one process, every server in guardian.toml.
+#
+#   sudo cp deploy/pstnhub-guardian.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pstnhub-guardian
+#
+# This is NOT a template unit any more. Adding a server means adding a [[server]]
+# block to guardian.toml and restarting, not enabling a second instance.
+#
+# Every path below points into the checkout. Change them together if you move it.
+[Unit]
+Description=PSTNHub Guardian (Squad beacon-auth game-port gate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+
+# --- least privilege --------------------------------------------------------
+# CAP_NET_ADMIN is required to modify nftables over netlink. Do NOT run as root;
+# run as a dedicated unprivileged user with only this capability.
+User=pstnhub-guardian
+Group=pstnhub-guardian
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# --- config -----------------------------------------------------------------
+# guardian.toml holds everything except the webhook. The webhook is a secret, so
+# it lives in guardian.env (mode 0600) and reaches the process as an environment
+# variable — never as a flag, which would be visible in `ps`.
+WorkingDirectory=/home/user/squad/PSTN/git/pstnhub-guardian
+EnvironmentFile=-/home/user/squad/PSTN/git/pstnhub-guardian/guardian.env
+ExecStartPre=/bin/mkdir -p /home/user/squad/PSTN/git/pstnhub-guardian/state
+ExecStart=/home/user/squad/PSTN/git/pstnhub-guardian/pstnhub-guardian \
+    /home/user/squad/PSTN/git/pstnhub-guardian/guardian.toml
+
+# --- fail-open on abrupt death ----------------------------------------------
+# Runs even on SIGKILL/OOM where the process defers cannot. Deleting each gating
+# chain reverts that game port to accept-all. `-` ignores errors (table already
+# gone, or that server was log-only and never had a chain). Uses the nft binary
+# so the path does not depend on the daemon being alive.
+#
+# ONE LINE PER SERVER. Adding a [[server]] to guardian.toml means adding its
+# table here too — this is the one place the config is not the single source of
+# truth, and the cost of forgetting is a drop rule that outlives the daemon.
+ExecStopPost=-/usr/sbin/nft delete chain inet squad_main input
+# ExecStopPost=-/usr/sbin/nft delete chain inet squad_server2 input
+ExecStopPost=-/bin/sh -c 'logger -t pstnhub-guardian "fail-open: gating chains removed on stop"'
+
+# --- watchdog ---------------------------------------------------------------
+# The daemon pings every heartbeat_interval (10s). If it stops, systemd kills and
+# restarts it, and ExecStopPost fires -> fail-open.
+WatchdogSec=30
+Restart=always
+RestartSec=2
+
+# --- hardening --------------------------------------------------------------
+# State lives in the checkout under /home, so ProtectHome must be off and the
+# repo explicitly writable. ProtectSystem=strict makes everything else read-only.
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/user/squad/PSTN/git/pstnhub-guardian
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,212 +1,389 @@
-# squad-gatekeeper
+# pstnhub-guardian
 
-A Linux sidecar daemon that gates the Squad game port by beacon authentication.
-It tails the Squad server log, allow-lists the source IP of every player that
+A Linux sidecar daemon that gates Squad game ports by beacon authentication.
+
+It tails each Squad server log, allow-lists the source IP of every player that
 completes the beacon (EOS) handshake, and — in enforce mode — default-drops the
-game port for everyone else.
+game port for everyone else. One process gates every server on the box.
 
 It runs **outside** the game server process, so it survives the server crashing
 and keeps the firewall correct across restarts.
 
-## Why this stops the crash exploit
+> **Alpha.** Running in production on one host. The nftables expression sequences
+> and the log regexes are the parts most likely to need adjusting for your build —
+> see [What is not proven](#what-is-not-proven).
 
-The crash is a null virtual dispatch reached through an Unreal control channel by
-a peer that **never authenticates** (no beacon handshake, `UniqueId: INVALID`).
-Because that peer never completes the beacon, it never lands on the allow-list, so
-in enforce mode its game-port packets are dropped before the server allocates the
-connection object the exploit needs. The filter never inspects payloads, so it is
-immune to the attacker mutating the packet bytes.
+---
 
-The only way past it is to complete a real beacon handshake first — i.e. actually
-authenticate with a real account — at which point the attacker is a named
-EOS/Steam identity you can permanently ban rather than a rotating VPN address.
+## The short version
 
-## Status: builds and vets clean; not yet run against a live server
-
-`GOOS=linux go build ./...` and `go vet` pass, and `go test ./internal/...` passes
-for the parser and tailer. What is still unverified is everything that needs a real
-kernel and a real log:
-
-- **`internal/firewall`** — the `google/nftables` expression sequences (payload
-  offsets, the set lookup, the UDP dport match). Compiling proves the API calls
-  exist, not that the rules are right. Confirm against `nft list ruleset` that the
-  generated rules match the chain layout in the package doc comment.
-- **`internal/parser`** — the two regexes are transcribed from the sample logs and
-  are covered by a unit test, but that test only proves they match *those* lines.
-  Re-confirm against a live log from **your** build; a plugin/engine bump can
-  reword them.
-- The `firewall` and `gate` packages are Linux-only (netlink), so they do not build
-  or test on macOS. Build them with `GOOS=linux`.
-
-## Where things are configured
-
-Everything per-server lives in one file in the checkout: `/home/user/squad/PSTN/git/pstnhub-guardian/<instance>.env`
-(gitignored — it holds the webhook)
-(template: `deploy/example.env`).
-
-| What | Where |
-|---|---|
-| Discord webhook | `DISCORD_WEBHOOK_URL=` in that env file. Never a flag — flags show up in `ps`. Empty/absent = notifications off, everything else still works. |
-| Ports | `GATEKEEPER_ARGS=... -game-port 7787 -beacon-port 15000 -query-port 27165` in that env file. |
-| Log path | `-log` inside `GATEKEEPER_ARGS`. |
-| Enforce | add `-enforce` to `GATEKEEPER_ARGS`. |
-| nftables table | `NFT_TABLE=` in that env file. |
-
-The port defaults (`7787` game, `15000` beacon, `27165` query) are **placeholders**.
-Confirm what your server actually binds before enforcing:
+A crash exploit reaches Squad through an Unreal control channel using a peer that
+**never authenticates**. Guardian makes the game port unreachable for anyone who
+has not completed a real beacon handshake, so the exploit never gets to the code
+it targets.
 
 ```
-ss -ulpn | grep SquadGameServer
+player -> beacon port (always open) -> completes EOS handshake
+                                            |
+                                            v
+                              guardian sees it in the log
+                                            |
+                                            v
+                          player IP added to the nftables allow-set
+                                            |
+                                            v
+player -> game port ------------------------+--> allowed
+attacker -> game port (never beaconed) --------> dropped in the kernel
 ```
 
-## Multiple servers on one box
+Three properties worth understanding before you deploy it:
 
-The unit is a systemd template, one instance per Squad server:
+- **It never inspects packet contents.** The filter is "is this source IP on the
+  allow-list", nothing more. An attacker mutating their packet bytes changes
+  nothing.
+- **It fails open, always.** Every exit path removes the drop rule. If the daemon
+  dies, crashes, is killed, or the box OOMs, the game port reverts to accept-all.
+  A broken guardian must never be a locked-out server.
+- **The only way past it is to actually authenticate**, at which point the
+  attacker is a named EOS/Steam identity you can permanently ban rather than a
+  rotating VPN address.
 
-```
-/home/user/squad/PSTN/git/pstnhub-guardian/main.env      ->  systemctl enable --now squad-gatekeeper@main
-/home/user/squad/PSTN/git/pstnhub-guardian/server2.env   ->  systemctl enable --now squad-gatekeeper@server2
-```
+---
 
-Each instance gets its own env file, its own state dir
-(`/home/user/squad/PSTN/git/pstnhub-guardian/state/<instance>/allow.json`, created by `ExecStartPre`)
-and its own log tail. Two things **must** differ between instances:
+## How it works, in detail
 
-- `NFT_TABLE` — sharing a table means sharing a chain, and one instance's drop
-  rule would gate the other's port. Name it after the instance (`squad_main`,
-  `squad_server2`).
-- `-game-port` — obviously.
+### What puts an IP on the allow-list
 
-`-beacon-port` and `-query-port` are only ever *accepted*, so overlap there is
-harmless, but set them correctly per server anyway.
-
-## Log rotation and `SquadGame_2.log`
-
-Squad does not rotate its log predictably. Both `SquadGame.log` and
-`SquadGame_2.log` can exist, and either one can be the live file depending on how
-the server was last restarted. A daemon pinned to a single path goes silently deaf
-in that case — exactly the failure that looks like "it just stopped working".
-
-So `-log` is a **pattern seed, not a fixed target**. `/x/SquadGame.log` becomes the
-pattern `/x/SquadGame*.log`, and the tailer:
-
-- follows whichever match has the newest mtime, re-checked every 5s;
-- switches when a sibling starts being written more recently than the current file
-  (a *stale* sibling never wins, in either direction);
-- reads the **first** file from the end (a restart must not replay old beacon lines
-  and re-allow long-gone IPs) and every **later** file from the start (it appeared
-  while we were running, so all of it is news);
-- still handles ordinary in-place rotation/truncation of one path via `ReOpen`.
-
-Covered by `internal/tailer/tailer_test.go`, including the flip case where
-`SquadGame.log` is the newer of the two.
-
-## Deploy runbook
-
-1. Build into the checkout — the unit and `run.sh` both expect the binary at
-   `/home/user/squad/PSTN/git/pstnhub-guardian/pstnhub-guardian`:
-   ```
-   cd /home/user/squad/PSTN/git/pstnhub-guardian
-   GOOS=linux GOARCH=amd64 go build -o pstnhub-guardian ./cmd/gatekeeper
-   ```
-2. Create the user: `useradd --system --no-create-home squad-gatekeeper`, then give
-   it the checkout: `chown -R squad-gatekeeper /home/user/squad/PSTN/git/pstnhub-guardian`.
-3. Copy `deploy/squad-gatekeeper@.service` to `/etc/systemd/system/`. If your
-   checkout is anywhere other than the path above, edit the four paths in it.
-4. Per server, copy `deploy/example.env` to `/home/user/squad/PSTN/git/pstnhub-guardian/<instance>.env`,
-   fill in the webhook, `NFT_TABLE`, ports and log path, then:
-   ```
-   chown squad-gatekeeper /home/user/squad/PSTN/git/pstnhub-guardian/<instance>.env
-   chmod 0600 /home/user/squad/PSTN/git/pstnhub-guardian/<instance>.env
-   ```
-5. Confirm the ports (`ss -ulpn | grep SquadGameServer`).
-6. `systemctl daemon-reload && systemctl enable --now squad-gatekeeper@<instance>`
-7. **Run log-only for at least a week.** Watch the journal:
-   ```
-   journalctl -u squad-gatekeeper@<instance> -f | grep "WOULD DROP"
-   ```
-   Every would-drop line should be the attacker or obvious garbage. If a real
-   player appears (the CGNAT / cached-direct-connect case — ~0.2% in our data),
-   investigate before enforcing.
-8. Once the would-drop list is clean across a restart or two, add `-enforce` to
-   `GATEKEEPER_ARGS` in that instance's env file and
-   `systemctl restart squad-gatekeeper@<instance>`.
-
-## Running under screen (no systemd)
-
-Easier to get going, and perfectly fine for the log-only validation week — log-only
-never installs a chain, so there is nothing to fail open. `deploy/run.sh` reads the
-**same** `/home/user/squad/PSTN/git/pstnhub-guardian/<instance>.env`, so the webhook and ports live in
-one place either way.
+One log line, and only one:
 
 ```
-sudo setcap cap_net_admin+ep /home/user/squad/PSTN/git/pstnhub-guardian/pstnhub-guardian   # or just run it with sudo
-screen -dmS gatekeeper-main /home/user/squad/PSTN/git/pstnhub-guardian/deploy/run.sh main
-screen -r gatekeeper-main      # watch it;  Ctrl-A D to detach
+LogNet: UNetConnection::Close: [UNetConnection] RemoteAddr: 1.2.3.4:43965,
+   ... Def:BeaconNetDriver ... UniqueId: RedpointEOS:00022f92c00c4537b96cd84fbe3d4bae
 ```
 
-Multiple servers: one screen session per instance, same as one systemd instance per
-server. `run.sh server2` reads `server2.env`.
+A beacon-driver close carrying a **resolved EOS id**. The id is proof the
+connection authenticated. Lines with `UniqueId: INVALID` are deliberately not
+matched — that is precisely the attacker's signature.
+
+The IP is added to an nftables set with a kernel-managed timeout (`allow_ttl`,
+default 60m). The kernel expires entries, so there is no timer for the daemon to
+get wrong.
+
+### What the firewall actually installs
+
+Per server, one table containing one set and one chain:
 
 ```
-screen -dmS gatekeeper-server2 /path/to/deploy/run.sh server2
+table inet squad_main {
+    set allowed { type ipv4_addr; flags timeout; }
+
+    chain input {
+        type filter hook input priority -10; policy accept;
+
+        udp dport 15000 accept                      # beacon: never gated
+        udp dport 27165 accept                      # query:  never gated
+        udp dport 7787 ip saddr @allowed accept     # game:   allowed players
+        udp dport 7787 limit rate 10/second log prefix "pstnhub-guardian drop: "
+        udp dport 7787 counter drop                 # game:   everyone else
+    }
+}
 ```
 
-**What you give up, and it only bites in enforce mode:** `run.sh` traps EXIT/INT/TERM
-and removes the gating chain on the way out, which covers Ctrl-C, the binary
-crashing, and closing the screen window. It cannot cover a SIGKILL of the process
-group or the box losing power, and there is no watchdog restarting a wedged daemon.
-Under systemd, `ExecStopPost` and `WatchdogSec` cover exactly those cases. So:
-screen for the log-only week, systemd before you add `-enforce` — or if you insist
-on screen while enforcing, put the backstop in root's crontab:
+The `log` rule is present only when `log_dropped_ips = true`.
 
-```
-@reboot /usr/sbin/nft delete chain inet squad_main input
+Two details that are load-bearing:
+
+- **The chain policy is `accept`, never `drop`.** The drop comes from an explicit
+  rule that can be deleted. A policy that failed to reset would lock out every
+  player.
+- **The log rule is separate from the drop rule and carries no verdict.** A
+  `limit` expression stops matching once the rate is exceeded; folding it into
+  the drop rule would make the rule end early and the packet fall through to the
+  accept policy — flooding fast enough would defeat the gate entirely. Keep them
+  separate.
+
+### Startup, and why it does not lock out a full server
+
+Three mechanisms, in order:
+
+1. **Persisted state.** Each server's allow-list is written to `state/<name>.json`
+   every 30s and reloaded on boot. Covers crash → restart.
+2. **Log backfill.** On start, the current live log is read from the beginning and
+   its beacon lines replayed, so players already connected are recognised without
+   having to re-authenticate. Runs concurrently with the live tail.
+3. **The tailer opens at END** for live following, so normal operation never
+   replays history.
+
+Backfill ages each entry by the **log's own timestamps**, not the wall clock:
+Squad writes local time with no timezone, so the last line in the file is treated
+as "now" and everything else is placed relative to it. Only differences are used,
+so the server's timezone cancels out. Entries already past `allow_ttl` are
+dropped, and only beacon lines are replayed — replaying game-connection lines
+would fire a would-drop alert per historical connection.
+
+### Log rotation
+
+Squad rotates on server start: the live log becomes
+`SquadGame-backup-<timestamp>.log` and a fresh `SquadGame.log` appears. It also
+writes `SquadGame-CRC.log` alongside.
+
+`log_path` is a **pattern seed**, not a fixed file. Guardian follows the newest
+live log matching `SquadGame.log` or `SquadGame_N.log`, and switches within 5s
+when Squad starts a new one. Rotated and CRC logs are **never** followed: they
+carry an mtime from the rotation instant, so a naive newest-file match latches
+onto a dead file and replays hours of history, re-allowing players who left long
+ago. A rotation means a server restart, which means every player disconnected, so
+the previous log is genuinely irrelevant.
+
+### What you see during an attack
+
+In enforce mode the kernel drops silently — no Squad log line, so no event, so no
+alert. Guardian recovers the two halves separately:
+
+- **Volume**: a counter on the drop rule, polled every 30s. Rising counts are
+  logged and pushed to Discord at most once per `notify_cooldown`.
+- **Identity**: *optional*, off by default. With `log_dropped_ips = true` a
+  rate-limited `log` rule puts source addresses in the kernel log, for
+  cross-referencing with other hosts:
+
+  ```bash
+  sudo journalctl -k --since "1 hour ago" | grep 'pstnhub-guardian drop' | grep -oP 'SRC=\K[0-9.]+' | sort | uniq -c | sort -rn
+  ```
+
+  The rate cap (`log_drop_rate`, default 10/s) makes this a *sample*, not a
+  census — good for identifying sources, useless for counting packets. Use the
+  counter for volume.
+
+  It is off by default because it is the only path where an attacker controls how
+  much you write to disk. The cap bounds that, and the rule is deliberately
+  separate from the drop rule so exceeding the rate stops the logging and never
+  the dropping — but the safest volume is still none. Turn it on when you want
+  addresses to share, off the rest of the time.
+
+---
+
+## Deploy guide
+
+### 1. Build
+
+```bash
+cd /home/user/squad/PSTN/git/pstnhub-guardian
+GOOS=linux GOARCH=amd64 go build -o pstnhub-guardian ./cmd/pstnhub-guardian
 ```
 
-If it ever does get stuck, the manual unlock is one command:
+The unit and `run.sh` both expect the binary at the repo root under that name.
 
+### 2. Create the service user
+
+```bash
+sudo useradd --system --no-create-home pstnhub-guardian
+sudo chown -R pstnhub-guardian /home/user/squad/PSTN/git/pstnhub-guardian
 ```
+
+The daemon needs `CAP_NET_ADMIN` to talk to nftables — granted by the unit file,
+not by running as root.
+
+### 3. Configure
+
+```bash
+cp deploy/example.toml guardian.toml
+cp deploy/example.env  guardian.env
+chmod 600 guardian.env
+```
+
+Fill in the webhook in `guardian.env`, and the log paths and ports in
+`guardian.toml`. **Confirm the ports against the running server first:**
+
+```bash
+ss -ulpn | grep SquadGame
+```
+
+Leave `enforce = false` for now. See the [config guide](#config-guide).
+
+### 4. Install the unit
+
+```bash
+sudo cp deploy/pstnhub-guardian.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pstnhub-guardian
+```
+
+If your checkout is not at `/home/user/squad/PSTN/git/pstnhub-guardian`, edit the
+paths in the unit first — systemd cannot derive them.
+
+### 5. Validate in log-only mode
+
+Run for **at least a week** and watch what it would have dropped:
+
+```bash
+journalctl -u pstnhub-guardian -f | grep 'WOULD DROP'
+```
+
+Every line should be the attacker or obvious garbage. If a real player appears —
+the CGNAT or cached-direct-connect case, roughly 0.2% in our data — investigate
+before enforcing. This week is the whole point: it is how you find out whether
+your player base has anyone the beacon-first assumption does not hold for.
+
+### 6. Enforce
+
+Set `enforce = true` in `guardian.toml`, then:
+
+```bash
+sudo systemctl restart pstnhub-guardian
+```
+
+Confirm all three:
+
+```bash
+journalctl -u pstnhub-guardian -n 50          # "Enforce mode active", backfill count
+sudo nft list ruleset | grep -A15 'table inet squad_main'
+```
+
+The backfill count should roughly match your current player count. If it is 0
+with players online, roll back.
+
+### Rollback
+
+Opens the port immediately, no restart, no rebuild:
+
+```bash
 sudo nft delete chain inet squad_main input
 ```
 
-## Fail-open
+Then set `enforce = false` and restart. One line per table if you run several
+servers.
 
-If the daemon is not healthy, the drop rule must not be installed. Three layers:
+### Running under screen instead
 
-- a deferred `firewall.Disable()` on every clean exit path and panic;
-  (under screen, `deploy/run.sh`'s EXIT trap is the equivalent — see above for
-  what it does and does not cover);
-- `WatchdogSec=30` + `Restart=always` — a wedged daemon is killed and restarted;
-- `ExecStopPost` runs `nft delete chain inet $NFT_TABLE input` even on SIGKILL/OOM,
-  where Go defers cannot run.
+Fine for the log-only week — log-only never installs a chain, so there is nothing
+to fail open.
 
-The safe failure is the attacker getting back in, never your players locked out.
-Test it: `systemctl kill -s SIGKILL squad-gatekeeper@<instance>` and confirm the game port is
-open to all afterward (`nft list table inet $NFT_TABLE`).
+```bash
+sudo setcap cap_net_admin+ep pstnhub-guardian
+screen -dmS guardian deploy/run.sh
+```
+
+`setcap` is wiped by every rebuild; re-run it after each `go build`. Do not use
+this for enforce mode: there is no watchdog, and a SIGKILL leaves the drop rules
+in place. Use systemd.
+
+---
+
+## Config guide
+
+Everything lives in `guardian.toml`, except the webhook, which is
+`DISCORD_WEBHOOK_URL` in `guardian.env`. The webhook is never a flag — flags are
+visible in `ps` to every user on the box.
+
+### Global
+
+| Key | Default | What it does |
+|---|---|---|
+| `enforce` | `false` | Master switch. `false` = log-only, nothing is ever dropped. This is the panic button: setting it false reverts every server at once. |
+| `allow_ttl` | `"60m"` | How long an authenticated IP stays allowed. Kernel-managed. |
+| `notify_cooldown` | `"5m"` | Per-source Discord aggregation window. |
+| `heartbeat_interval` | `"10s"` | systemd watchdog ping. Keep well under `WatchdogSec` (30s). |
+| `state_dir` | `"state"` | Where per-server allow-lists persist. |
+| `log_level` | `"info"` | `debug`, `info`, `warn`, `error`. |
+| `log_dropped_ips` | `false` | Write dropped packets' source addresses to the kernel log (`journalctl -k`). Off by default: attacker-controlled write volume. |
+| `log_drop_rate` | `10` | Per-second cap on those lines. Makes the record a sample, not a census. |
+
+### Per server
+
+One `[[server]]` block each.
+
+| Key | Required | What it does |
+|---|---|---|
+| `name` | yes | Identifies the server in logs, alerts, and its state filename. Unique, filesystem-safe. |
+| `log_path` | yes | Pattern seed for the Squad log. `.../SquadGame.log` also follows `SquadGame_2.log`. |
+| `game_port` | yes | The gated port. |
+| `beacon_port` | — | Never gated. Gating it would break the only path onto the allow-list. |
+| `query_port` | — | Never gated. |
+| `nft_table` | — | Defaults to `squad_<name>`. Must be unique per server. |
+| `nft_set` | — | Defaults to `allowed`. |
+| `enforce` | — | Per-server opt-out. Omitted = follow the global switch. A server cannot opt *in* while the global switch is off. |
+
+The loader refuses to start on a duplicate `name`, a duplicate `nft_table`, or a
+duplicate `game_port`. All three fail silently at runtime — two servers sharing a
+table fight over the same chain and one gates the other's port — so they are made
+fatal at load instead.
+
+### Adding a server
+
+1. Add a `[[server]]` block to `guardian.toml`.
+2. Add its table to the `ExecStopPost` lines in the unit file. **This is the one
+   place the config is not the single source of truth**, and forgetting it means
+   a drop rule that outlives the daemon.
+3. `sudo systemctl restart pstnhub-guardian`.
+
+To bring a new server up carefully while the others enforce, set `enforce = false`
+in just its block.
+
+---
+
+## Log format
+
+Guardian logs in the same shape as Squad's own log, so reading both during an
+incident does not mean switching formats:
+
+```
+[30.08.2026-16:02:11.123] [Gate:main] Allowed player. [1.2.3.4 | 00022f92c00c4537b96cd84fbe3d4bae]
+[30.08.2026-16:02:14.007] [Firewall:main WARN] Enforce mode active, game port is default-drop. [port=7787]
+[30.08.2026-16:05:02.881] [Guardian] All servers running. [servers=2]
+```
+
+`[DD.MM.YYYY-HH:MM:SS.mmm] [Category:server] Message. [subject]`
+
+The trailing bracket is the subject of the line — IP and EOS id when the event is
+about a player, otherwise the relevant key/values. It is always last, so
+addresses are greppable from any line:
+
+```bash
+journalctl -u pstnhub-guardian | grep -oP '\[\K[0-9.]+(?= \|)' | sort -u
+```
+
+Categories: `Guardian`, `Config`, `Server:<name>`, `Gate:<name>`,
+`Firewall:<name>`, `Notify`, `Watchdog`. `WARN` and `ERROR` are appended to the
+category; info is unmarked, as in Squad's log.
+
+---
 
 ## Layout
 
 ```
-cmd/gatekeeper/main.go            wiring, signals, watchdog, fail-open defer
-internal/config                   flags + env (webhook is env-only)
-internal/tailer                   newest-log-wins follow: rotation + sibling switch
-internal/parser                   log line -> typed event (the two regexes)
-internal/firewall                 nftables over netlink: allow-set + gate rules
-internal/gate                     decision layer + allow-list mirror + persistence
-internal/notifier                 non-blocking Discord webhook w/ per-IP aggregation
-deploy/squad-gatekeeper@.service  systemd template, one instance per server
-deploy/example.env                per-instance config (webhook, ports, table)
-deploy/run.sh                     screen launcher: same env file, trap-based fail-open
+cmd/pstnhub-guardian/   entry point, per-server supervision
+internal/config/        TOML loading, defaults, collision checks
+internal/logging/       Squad-style slog handler
+internal/tailer/        log discovery, rotation, following, startup backfill
+internal/parser/        the two regexes that matter
+internal/gate/          decision layer + allow-list persistence
+internal/firewall/      nftables over netlink
+internal/notifier/      Discord webhook, aggregated
+deploy/                 unit file, config templates, screen runner
 ```
 
-## What this is not
+---
 
-- Not a payload analyzer. It decides *whether the game port opens for an IP*, from
-  the beacon event — it never inspects attack packets.
-- Not a replacement for the vendor fix. The null-deref bug still exists in the EOS
-  plugin; this makes it unreachable on your server. Report the bug so it's fixed
-  for everyone (see the investigation handoff).
-- Not IPv6-aware yet. The allow-set and `Allow()` handle IPv4 only; extend if your
-  players connect over v6.
+## What is not proven
+
+`go build`, `go vet`, and the test suite pass. What they cannot cover:
+
+- **`internal/firewall`** — the `google/nftables` expression sequences (payload
+  offsets, set lookup, UDP dport match, the limit/log rule ordering). Compiling
+  proves the API calls exist, not that the rules are right. Confirm against
+  `sudo nft -a list chain inet squad_main input` that the generated chain matches
+  the layout above, and that the log rule sits *before* the drop rule.
+- **`internal/parser`** — the two regexes are transcribed from sample logs and
+  covered by a unit test, but that test only proves they match *those* lines.
+  Re-confirm against a live log from **your** build; a plugin or engine bump can
+  reword them.
+- **Multi-server** — the config, collision checks, and per-server supervision are
+  tested, but the alpha has only run against a single server in production.
+- `firewall` and `gate` are Linux-only (netlink) and do not build on macOS or
+  Windows. Build and test them with `GOOS=linux`.
+
+Race detector needs cgo, so run it on the Linux host:
+
+```bash
+CGO_ENABLED=1 go test -race ./internal/...
 ```

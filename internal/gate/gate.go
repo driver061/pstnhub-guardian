@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourorg/squad-gatekeeper/internal/firewall"
-	"github.com/yourorg/squad-gatekeeper/internal/notifier"
-	"github.com/yourorg/squad-gatekeeper/internal/parser"
+	"github.com/pstnhub/pstnhub-guardian/internal/firewall"
+	"github.com/pstnhub/pstnhub-guardian/internal/notifier"
+	"github.com/pstnhub/pstnhub-guardian/internal/parser"
 )
 
 type Gate struct {
@@ -27,18 +27,22 @@ type Gate struct {
 	log     *slog.Logger
 	enforce bool
 	ttl     time.Duration
+	// server names this gate in alerts. Logs get it from the logger category,
+	// but Discord titles are shared across servers and must say which one.
+	server string
 
 	mu      sync.Mutex
 	allowed map[netip.Addr]time.Time // in-memory mirror, value = expiry
 }
 
-func New(fw *firewall.Firewall, notif *notifier.Notifier, log *slog.Logger, enforce bool, ttl time.Duration) *Gate {
+func New(fw *firewall.Firewall, notif *notifier.Notifier, log *slog.Logger, enforce bool, ttl time.Duration, server string) *Gate {
 	return &Gate{
 		fw:      fw,
 		notif:   notif,
 		log:     log,
 		enforce: enforce,
 		ttl:     ttl,
+		server:  server,
 		allowed: make(map[netip.Addr]time.Time),
 	}
 }
@@ -109,12 +113,12 @@ func (g *Gate) allow(ip netip.Addr, eos string, at time.Time) {
 	if err := g.fw.Allow(ip); err != nil {
 		g.log.Error("allow failed", "ip", ip, "err", err)
 		// An allow failure in enforce mode means a legitimate player may be
-		// dropped. Surface it as a health alert — this is a gatekeeper problem,
+		// dropped. Surface it as a health alert — this is a guardian problem,
 		// not an attacker one.
-		g.notif.Health("allow-list write failed", ip.String()+": "+err.Error())
+		g.notif.Health("Allow-list write failed ["+g.server+"]", ip.String()+": "+err.Error())
 		return
 	}
-	g.log.Info("allowed", "ip", ip, "eos", eos)
+	g.log.Info("allowed player", "ip", ip, "eos", eos)
 }
 
 func (g *Gate) checkGame(ip netip.Addr) {
@@ -133,11 +137,11 @@ func (g *Gate) checkGame(ip netip.Addr) {
 		// Seeing a game-accepted line for an unknown IP means either a race (game
 		// conn between beacon-close and our allow write — unlikely given the
 		// multi-second gap) or a gap in coverage. Worth an incident either way.
-		g.log.Warn("game connection from non-allowed IP (enforce mode)", "ip", ip)
-		g.notif.Incident(ip, "Unallowed game connection", ip.String()+" reached the game port without a beacon auth")
+		g.log.Warn("game connection from non-allowed IP", "ip", ip)
+		g.notif.Incident(ip, "Unallowed game connection ["+g.server+"]", ip.String()+" reached the game port without a beacon auth")
 	} else {
 		// log-only mode: this is the would-be drop we are validating against.
-		g.log.Info("WOULD DROP: game connection from non-allowed IP", "ip", ip)
-		g.notif.Incident(ip, "Would-drop (log-only)", ip.String()+" would have been dropped: no beacon auth")
+		g.log.Info("WOULD DROP, game connection from non-allowed IP", "ip", ip)
+		g.notif.Incident(ip, "Would-drop, log-only ["+g.server+"]", ip.String()+" would have been dropped: no beacon auth")
 	}
 }

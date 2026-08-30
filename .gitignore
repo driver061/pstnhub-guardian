@@ -1,6 +1,9 @@
-# Per-instance config holds DISCORD_WEBHOOK_URL. Never commit it.
+# The webhook secret.
 *.env
 !deploy/example.env
+
+# Per-host config: real log paths and ports. Start from deploy/example.toml.
+guardian.toml
 
 # Runtime allow-list state and the built binary.
 state/

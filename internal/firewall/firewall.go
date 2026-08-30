@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"golang.org/x/sys/unix"
 )
 
 // policyAccept is the chain's default verdict. Accept, always: the drop must come
@@ -37,6 +38,13 @@ type Config struct {
 	BeaconPort uint16
 	QueryPort  uint16
 	AllowTTL   time.Duration
+
+	// LogDropped puts the source address of dropped packets into the kernel log.
+	// Off by default: it is the one path where an attacker controls how much you
+	// write to disk. LogRate caps that, but the safest volume is none.
+	LogDropped bool
+	// LogRate is the per-second ceiling on those log lines. Zero means 10.
+	LogRate uint64
 }
 
 type Firewall struct {
@@ -44,7 +52,9 @@ type Firewall struct {
 	conn  *nftables.Conn
 	table *nftables.Table
 	set   *nftables.Set
-	// dropRule is retained so Disable() can delete precisely what Enable() added.
+	// dropRule is retained so Disable() can delete precisely what Enable() added
+	// and so DropCount() can read its counter. The log rule needs no handle: it
+	// goes away with the chain.
 	dropRule *nftables.Rule
 }
 
@@ -112,7 +122,7 @@ func (f *Firewall) Enable() error {
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookInput,
 		Priority: nftables.ChainPriorityRef(-10), // ahead of most default rules
-		Policy:   &policyAccept, // fail-open default: an empty/half-built chain accepts
+		Policy:   &policyAccept,                  // fail-open default: an empty/half-built chain accepts
 	})
 
 	// accept beacon
@@ -121,6 +131,10 @@ func (f *Firewall) Enable() error {
 	f.acceptUDPPort(chain, f.cfg.QueryPort)
 	// accept game when source is in the allow-set
 	f.acceptGameIfAllowed(chain)
+	// log a rate-limited sample of what is about to be dropped, for IOC sharing
+	if f.cfg.LogDropped {
+		f.logDropped(chain)
+	}
 	// drop everything else on the game port — kept for precise teardown
 	f.dropRule = f.dropGamePort(chain)
 
@@ -186,9 +200,67 @@ func (f *Firewall) dropGamePort(chain *nftables.Chain) *nftables.Rule {
 	r := &nftables.Rule{
 		Table: f.table,
 		Chain: chain,
-		Exprs: append(matchUDPDport(f.cfg.GamePort), &expr.Verdict{Kind: expr.VerdictDrop}),
+		// The counter makes the drop visible at all: without it a blocked packet
+		// leaves no trace anywhere, and an attack looks identical to silence.
+		Exprs: append(matchUDPDport(f.cfg.GamePort), &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop}),
 	}
 	return f.conn.AddRule(r)
+}
+
+// logDropped logs a rate-limited sample of the packets the NEXT rule drops, so
+// the attacker's source addresses land in the kernel log (journalctl -k) where
+// they can be pulled out and shared with other hosts.
+//
+// SAFETY: this is a SEPARATE rule with NO verdict, sitting immediately before the
+// drop rule. It must stay that way. Folding the limit into the drop rule would
+// invert the filter: a limit expression does not match once the rate is exceeded,
+// so the rule would stop early and the packet would fall through to the chain's
+// accept policy — i.e. flooding fast enough would defeat the gate entirely. Here,
+// exceeding the rate merely stops the logging; the drop below is unconditional.
+//
+// The rate cap is what keeps an attacker from turning your disk into the target:
+// 10 lines/second regardless of how many packets arrive.
+func (f *Firewall) logDropped(chain *nftables.Chain) *nftables.Rule {
+	rate := f.cfg.LogRate
+	if rate == 0 {
+		rate = 10
+	}
+	exprs := append(matchUDPDport(f.cfg.GamePort),
+		&expr.Limit{
+			Type:  expr.LimitTypePkts,
+			Rate:  rate,
+			Unit:  expr.LimitTimeSecond,
+			Burst: 5,
+		},
+		&expr.Log{
+			Key:  1 << unix.NFTA_LOG_PREFIX,
+			Data: []byte("pstnhub-guardian drop: "),
+		},
+	)
+	return f.conn.AddRule(&nftables.Rule{Table: f.table, Chain: chain, Exprs: exprs})
+}
+
+// DropCount returns the packet and byte totals on the drop rule, or ok=false if
+// the rule is not installed (log-only mode) or cannot be read.
+func (f *Firewall) DropCount() (packets, bytes uint64, ok bool) {
+	if f.dropRule == nil || f.table == nil {
+		return 0, 0, false
+	}
+	rules, err := f.conn.GetRules(f.table, f.dropRule.Chain)
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, r := range rules {
+		if r.Handle != f.dropRule.Handle {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, isCounter := e.(*expr.Counter); isCounter {
+				return c.Packets, c.Bytes, true
+			}
+		}
+	}
+	return 0, 0, false
 }
 
 // matchUDPDport builds the expr sequence matching "udp dport == port".

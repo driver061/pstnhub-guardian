@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/yourorg/squad-gatekeeper/internal/parser"
+	"github.com/pstnhub/pstnhub-guardian/internal/parser"
 )
 
 // maxBackfill caps how much of the log we replay. A 35MB log is normal here and
