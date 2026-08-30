@@ -32,6 +32,7 @@ const (
 	KindOther        Kind = iota
 	KindBeaconAuthed      // an IP completed the beacon handshake (allow it)
 	KindGameAccepted      // a game-driver connection was accepted (log-only interest)
+	KindExploit           // the crash exploit's own footprint (revoke the IP)
 )
 
 type Event struct {
@@ -69,15 +70,31 @@ func stampOf(line string) time.Time {
 	return time.Date(n(m[1]), time.Month(n(m[2])), n(m[3]), n(m[4]), n(m[5]), n(m[6]), n(m[7])*int(time.Millisecond), time.UTC)
 }
 
+// logNet anchors a pattern to a real LogNet line: Unreal's [stamp][frame] prefix
+// followed by the category. Without this anchor the patterns match ANYWHERE in a
+// line, and the exploit puts attacker-controlled text (team names, layer names)
+// into LogSquadGameEvents lines — a crafted name containing a fake beacon-close
+// would allow-list an arbitrary IP.
+const logNet = `^\[[0-9.\-:]+\]\[[ 0-9]+\]LogNet: `
+
 // A game-driver connection line. Matches only GameNetDriver acceptances.
 var reGameAccepted = regexp.MustCompile(
-	`NotifyAcceptedConnection:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Def:GameNetDriver`,
+	logNet + `NotifyAcceptedConnection:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Def:GameNetDriver`,
+)
+
+// The exploit's footprint: the engine closing a connection with a security
+// reason. "poc" is what the current crash tool leaves behind, but any
+// LogSecurity close is a peer sending something the engine refused — no
+// legitimate client produces one. Matched on the category, not the reason
+// string, so a renamed payload still trips it.
+var reExploit = regexp.MustCompile(
+	`^\[[0-9.\-:]+\]\[[ 0-9]+\]LogSecurity: Warning: (\d{1,3}(?:\.\d{1,3}){3}):\d+: Closed:`,
 )
 
 // A beacon-driver close that carries a resolved EOS id. The EOS id proves the
 // connection authenticated; INVALID lines are deliberately NOT matched.
 var reBeaconAuthed = regexp.MustCompile(
-	`UNetConnection::Close:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Def:BeaconNetDriver.*UniqueId:\s*RedpointEOS:([0-9a-fA-F]{32})`,
+	logNet + `UNetConnection::Close:.*RemoteAddr:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Def:BeaconNetDriver.*UniqueId:\s*RedpointEOS:([0-9a-fA-F]{32})`,
 )
 
 // Parse classifies a single log line. Returns (Event, true) on a match.
@@ -85,6 +102,11 @@ func Parse(line string) (Event, bool) {
 	if m := reBeaconAuthed.FindStringSubmatch(line); m != nil {
 		if ip, err := netip.ParseAddr(m[1]); err == nil {
 			return Event{Kind: KindBeaconAuthed, IP: ip, EOSID: m[2], Raw: line, At: stampOf(line)}, true
+		}
+	}
+	if m := reExploit.FindStringSubmatch(line); m != nil {
+		if ip, err := netip.ParseAddr(m[1]); err == nil {
+			return Event{Kind: KindExploit, IP: ip, Raw: line, At: stampOf(line)}, true
 		}
 	}
 	if m := reGameAccepted.FindStringSubmatch(line); m != nil {

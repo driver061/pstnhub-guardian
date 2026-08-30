@@ -33,6 +33,11 @@ type Gate struct {
 
 	mu      sync.Mutex
 	allowed map[netip.Addr]time.Time // in-memory mirror, value = expiry
+	eos     map[netip.Addr]string    // last EOS id seen beaconing from that IP
+	// banned IPs are refused re-entry to the allow-list. Populated only by the
+	// exploit path. In memory only: a restart clears it, deliberately — a
+	// permanent ban belongs in your admin list against the EOS id, not here.
+	banned map[netip.Addr]bool
 }
 
 func New(fw *firewall.Firewall, notif *notifier.Notifier, log *slog.Logger, enforce bool, ttl time.Duration, server string) *Gate {
@@ -44,6 +49,8 @@ func New(fw *firewall.Firewall, notif *notifier.Notifier, log *slog.Logger, enfo
 		ttl:     ttl,
 		server:  server,
 		allowed: make(map[netip.Addr]time.Time),
+		eos:     make(map[netip.Addr]string),
+		banned:  make(map[netip.Addr]bool),
 	}
 }
 
@@ -86,6 +93,8 @@ func (g *Gate) Handle(ev parser.Event) {
 		g.allow(ev.IP, ev.EOSID, ev.At)
 	case parser.KindGameAccepted:
 		g.checkGame(ev.IP)
+	case parser.KindExploit:
+		g.revoke(ev.IP)
 	}
 }
 
@@ -101,6 +110,14 @@ func (g *Gate) allow(ip netip.Addr, eos string, at time.Time) {
 	exp := at.Add(g.ttl)
 
 	g.mu.Lock()
+	if g.banned[ip] {
+		g.mu.Unlock()
+		g.log.Warn("refused re-allow of banned IP", "ip", ip, "eos", eos)
+		return
+	}
+	if eos != "" {
+		g.eos[ip] = eos
+	}
 	if cur, ok := g.allowed[ip]; !ok || exp.After(cur) {
 		g.allowed[ip] = exp
 	}
@@ -119,6 +136,29 @@ func (g *Gate) allow(ip netip.Addr, eos string, at time.Time) {
 		return
 	}
 	g.log.Info("allowed player", "ip", ip, "eos", eos)
+}
+
+// revoke handles the exploit footprint: an IP that beaconed legitimately and then
+// sent the crash payload at the game port. Passing the beacon is cheap, so the
+// allow-list has to be revocable. The EOS id it authenticated with is what you
+// actually ban — the IP rotates, the account costs something.
+func (g *Gate) revoke(ip netip.Addr) {
+	g.mu.Lock()
+	id := g.eos[ip]
+	delete(g.allowed, ip)
+	g.banned[ip] = true
+	g.mu.Unlock()
+
+	if err := g.fw.Revoke(ip); err != nil {
+		g.log.Error("revoke failed", "ip", ip, "err", err)
+		g.notif.Health("Revoke failed ["+g.server+"]", ip.String()+": "+err.Error())
+	}
+	if id == "" {
+		id = "unknown (no beacon seen this run)"
+	}
+	g.log.Warn("exploit payload, IP revoked and banned", "ip", ip, "eos", id)
+	g.notif.Incident(ip, "Exploit payload ["+g.server+"]",
+		ip.String()+" sent a payload the engine refused (LogSecurity close). Revoked and banned. EOS id: "+id)
 }
 
 func (g *Gate) checkGame(ip netip.Addr) {

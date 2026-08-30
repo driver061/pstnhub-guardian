@@ -106,6 +106,21 @@ func (f *Firewall) Allow(ip netip.Addr) error {
 	return f.conn.Flush()
 }
 
+// Revoke removes ip from the allow-set. Used when an allow-listed IP turns out
+// to be hostile: the beacon handshake is cheap enough that an attacker can pass
+// it and then abuse the game port, so the gate needs a way back out. In enforce
+// mode the drop rule applies to that IP from the next packet on.
+func (f *Firewall) Revoke(ip netip.Addr) error {
+	if !ip.Is4() {
+		return fmt.Errorf("non-ipv4 address not supported: %s", ip)
+	}
+	v4 := ip.As4()
+	if err := f.conn.SetDeleteElements(f.set, []nftables.SetElement{{Key: v4[:]}}); err != nil {
+		return fmt.Errorf("delete element %s: %w", ip, err)
+	}
+	return f.conn.Flush()
+}
+
 // Enable installs the gating chain and drop rule. After this, game-port traffic
 // from IPs not in the allow-set is dropped. Beacon and query ports are accepted
 // unconditionally so players can always authenticate.

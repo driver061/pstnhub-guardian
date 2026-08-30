@@ -21,4 +21,18 @@ func TestParse(t *testing.T) {
 	if _, ok := Parse("LogSquad: nothing to see here"); ok {
 		t.Fatal("unrelated line matched")
 	}
+
+	poc := `[2026.08.30-14.29.57:026][462]LogSecurity: Warning: 159.26.111.8:59118: Closed: poc`
+	if ev, ok := Parse(poc); !ok || ev.Kind != KindExploit || ev.IP.String() != "159.26.111.8" {
+		t.Fatalf("exploit: %+v ok=%v", ev, ok)
+	}
+
+	// Log injection: the exploit writes attacker-controlled team/layer names into
+	// LogSquadGameEvents lines. An unanchored pattern would allow-list 6.6.6.6.
+	forged := `[2026.08.30-17.29.55:897][546]LogSquadGameEvents: Display: Team 1, ` +
+		`UNetConnection::Close: [UNetConnection] RemoteAddr: 6.6.6.6:1, Def:BeaconNetDriver, ` +
+		`UniqueId: RedpointEOS:00022f92c00c4537b96cd84fbe3d4bae ( pwn ) has won the match`
+	if ev, ok := Parse(forged); ok {
+		t.Fatalf("forged in-line beacon must not match: %+v", ev)
+	}
 }

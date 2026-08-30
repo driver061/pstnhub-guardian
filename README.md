@@ -77,6 +77,18 @@ their next join. Without that refresh the set entry would expire an hour after
 the beacon regardless of activity, and everyone would be dropped mid-game, since
 the handshake happens once at join and nothing would re-add them.
 
+Two hardening notes, both from the August 2026 exploit that authenticates first:
+
+- Every pattern is anchored to Unreal's `[stamp][frame]LogNet: ` prefix. The
+  exploit writes attacker-chosen team and layer names into the log, so an
+  unanchored substring match would let a crafted name forge a beacon line and
+  allow-list any IP.
+- A `LogSecurity: Warning: <ip>:<port>: Closed: ...` line revokes that IP from
+  the set immediately and bans it from being re-added until guardian restarts.
+  No legitimate client makes the engine close a connection for a security
+  reason. The alert carries the EOS id that IP beaconed with — that is what you
+  permaban, since the address rotates and the account does not.
+
 ### What the firewall actually installs
 
 Per server, one table containing one set and one chain:
