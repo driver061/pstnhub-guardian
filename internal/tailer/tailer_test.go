@@ -90,3 +90,33 @@ func recv(t *testing.T, ch <-chan string) string {
 		return ""
 	}
 }
+
+// Squad drops rotated and CRC logs next to the live one, stamped at the rotation
+// instant — newer than the empty log it just created. Following one of those
+// replays hours of history from SEEK_SET and re-allows departed IPs.
+func TestNewestIgnoresRotatedAndCRCLogs(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "SquadGame.log")
+
+	old := time.Now().Add(-time.Minute)
+	for name, mod := range map[string]time.Time{
+		"SquadGame.log":                                old,
+		"SquadGame_2.log":                              old,
+		"SquadGame-backup-2026.08.30-13.00.36.log":     time.Now(),
+		"SquadGame-CRC.log":                            time.Now(),
+		"SquadGame-CRC-backup-2026.08.30-12.56.07.log": time.Now(),
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The decoys are the newest files in the directory; neither may be chosen.
+	if got := New(live).newest(""); got != live && got != filepath.Join(dir, "SquadGame_2.log") {
+		t.Fatalf("newest picked a rotated/CRC log: %s", got)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,16 +32,35 @@ import (
 var pollInterval = 5 * time.Second
 
 type Tailer struct {
-	glob string // e.g. /path/SquadGame*.log
+	dir  string
+	name *regexp.Regexp // matches live logs only, never rotated ones
 }
 
 // New builds a tailer from the configured log path. The path is treated as a
-// *representative* name, not a fixed target: /x/SquadGame.log yields the pattern
-// /x/SquadGame*.log, which also matches SquadGame_2.log, SquadGame_3.log, etc.
+// *representative* name, not a fixed target: /x/SquadGame.log also matches
+// /x/SquadGame_2.log, /x/SquadGame_3.log, etc.
+//
+// It deliberately does NOT match everything under SquadGame*.log. Squad drops
+// two other families into the same directory:
+//
+//	SquadGame-backup-2026.08.30-13.00.36.log   the previous log, at rotation
+//	SquadGame-CRC.log / SquadGame-CRC-backup-*.log
+//
+// Both get an mtime at the rotation instant, i.e. newer than the empty log Squad
+// has just created. A glob that matches them makes newest() pick a dead file and
+// — because switched-to files open at SEEK_SET — replay its whole history,
+// re-allowing IPs that left hours ago. Only stem and stem_N are live.
 func New(path string) *Tailer {
 	dir, base := filepath.Split(path)
-	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	return &Tailer{glob: filepath.Join(dir, stem+"*"+filepath.Ext(base))}
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if dir == "" {
+		dir = "."
+	}
+	return &Tailer{
+		dir:  dir,
+		name: regexp.MustCompile(`^` + regexp.QuoteMeta(stem) + `(_\d+)?` + regexp.QuoteMeta(ext) + `$`),
+	}
 }
 
 // Follow tails the newest matching log and sends each line to out, switching
@@ -84,8 +104,17 @@ func (t *Tailer) Follow(ctx context.Context, out chan<- string) error {
 // the file we are already on: a candidate only wins if it is strictly newer, so
 // a stale sibling can never steal us away from the live log.
 func (t *Tailer) newest(cur string) string {
-	matches, err := filepath.Glob(t.glob)
-	if err != nil || len(matches) == 0 {
+	ents, err := os.ReadDir(t.dir)
+	if err != nil {
+		return ""
+	}
+	var matches []string
+	for _, e := range ents {
+		if t.name.MatchString(e.Name()) {
+			matches = append(matches, filepath.Join(t.dir, e.Name()))
+		}
+	}
+	if len(matches) == 0 {
 		return ""
 	}
 	best, bestMod := "", time.Time{}
