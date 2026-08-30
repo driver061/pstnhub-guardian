@@ -173,15 +173,18 @@ GOOS=linux GOARCH=amd64 go build -o pstnhub-guardian ./cmd/pstnhub-guardian
 
 The unit and `run.sh` both expect the binary at the repo root under that name.
 
-### 2. Create the service user
+### 2. Create the service user (systemd only)
+
+Skip this under screen: there you run as your own user, with the capability
+granted directly to the binary by `setcap`.
 
 ```bash
 sudo useradd --system --no-create-home pstnhub-guardian
 sudo chown -R pstnhub-guardian /home/user/squad/PSTN/git/pstnhub-guardian
 ```
 
-The daemon needs `CAP_NET_ADMIN` to talk to nftables — granted by the unit file,
-not by running as root.
+Either way the daemon needs `CAP_NET_ADMIN` to talk to nftables — from the unit
+file or from `setcap`, never from running as root.
 
 ### 3. Configure
 
@@ -200,16 +203,10 @@ ss -ulpn | grep SquadGame
 
 Leave `enforce = false` for now. See the [config guide](#config-guide).
 
-### 4. Run it
+### 4. Run it under screen
 
-Two ways. **4a** is quicker to get going and fine for the log-only week; **4b**
-is what you want before enforcing. Pick one — do not run both, they would fight
-over the same nftables tables.
-
-#### 4a. Under screen
-
-Log-only never installs a chain, so there is nothing to fail open and nothing to
-leave behind if this dies.
+The normal way to run this. Squad boxes already live in screen sessions, and the
+guardian is one more window alongside them.
 
 ```bash
 sudo setcap cap_net_admin+ep pstnhub-guardian
@@ -218,53 +215,54 @@ screen -r guardian      # watch it;  Ctrl-A D to detach
 ```
 
 `run.sh` finds `guardian.toml`, `guardian.env` and the binary relative to its own
-location, so a moved checkout still works. Its EXIT trap removes every gating
-chain on Ctrl-C, a crash, or the window closing — it reads the table names out of
-your config, so it stays correct as you add servers.
+location, so a moved or renamed checkout still works. Its EXIT trap removes every
+gating chain on Ctrl-C, on the binary crashing, or on the window being closed —
+and it reads the table names out of your config, so it stays correct as you add
+servers.
 
-Two caveats:
+If you get `deploy/run.sh: Permission denied`, the executable bit did not survive
+the checkout: `chmod +x deploy/run.sh`, or run it as `sh deploy/run.sh`.
 
-- `setcap` is wiped by every rebuild. Re-run it after each `go build`.
-- The trap **cannot** run on SIGKILL, OOM, or power loss. Harmless in log-only.
-  In enforce mode it means drop rules outliving the daemon and players locked out
-  until someone runs `nft delete chain inet squad_main input`. Use 4b to enforce,
-  or put that command in root's crontab as `@reboot`.
+`setcap` is wiped by every rebuild. Re-run it after each `go build`.
 
-If `deploy/run.sh: Permission denied`, the executable bit did not survive the
-checkout: `chmod +x deploy/run.sh`, or run it as `sh deploy/run.sh`.
+#### Surviving a reboot
 
-#### 4b. Under systemd (recommended, required for enforce)
+Two lines in the service user's crontab (`crontab -e`):
 
-```bash
-sudo cp deploy/pstnhub-guardian.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now pstnhub-guardian
+```cron
+@reboot sleep 30 && cd /home/user/squad/PSTN/git/pstnhub-guardian && screen -dmS guardian deploy/run.sh
 ```
 
-If your checkout is not at `/home/user/squad/PSTN/git/pstnhub-guardian`, edit the
-paths in the unit first — systemd cannot derive them.
+The `sleep 30` lets the Squad servers come up first, so the log files exist and
+backfill has something to read. If they take longer, raise it — a guardian that
+starts early is not broken, it just starts with an empty allow-list and fills it
+from the live log.
 
-This is the supervised path, and it is what makes enforce mode safe:
+And the backstop that matters in enforce mode, in **root's** crontab:
 
-- `CAP_NET_ADMIN` is granted by the unit, so no `setcap` and no root.
-- `WatchdogSec=30` + `Restart=always` catches a wedged daemon; `run.sh` cannot.
-- `ExecStopPost` flushes the gating chains even on SIGKILL/OOM, where process
-  defers never run. **One line per server** — adding a `[[server]]` means adding
-  its table there too.
-- `ProtectSystem`, `RestrictAddressFamilies` and a dedicated service user.
+```cron
+@reboot /usr/sbin/nft delete chain inet squad_main input 2>/dev/null
+```
 
-Coming from 4a, stop the screen session first (`screen -S guardian -X quit`) so
-its trap removes the chains cleanly.
+One line per server table. This covers the one case `run.sh` cannot: SIGKILL, OOM,
+or power loss, where the EXIT trap never runs and the drop rules survive into the
+next boot with no daemon to maintain them. Without it, a hard kill in enforce mode
+means players locked out until someone notices. In log-only mode none of this
+applies — no chain is ever installed.
 
 ### 5. Validate in log-only mode
 
 Run for **at least a week** and watch what it would have dropped:
 
 ```bash
-journalctl -u pstnhub-guardian -f | grep 'WOULD DROP'
+screen -r guardian      # Ctrl-A D to detach again
 ```
 
-Under screen (4a) the daemon logs to the terminal instead: `screen -r guardian`.
+Under systemd it goes to the journal instead:
+
+```bash
+journalctl -u pstnhub-guardian -f | grep 'WOULD DROP'
+```
 
 Every line should be the attacker or obvious garbage. If a real player appears —
 the CGNAT or cached-direct-connect case, roughly 0.2% in our data — investigate
@@ -273,23 +271,23 @@ your player base has anyone the beacon-first assumption does not hold for.
 
 ### 6. Enforce
 
-Set `enforce = true` in `guardian.toml`, then restart. Under systemd (4b):
-
-```bash
-sudo systemctl restart pstnhub-guardian
-```
-
-Under screen (4a) — but read the SIGKILL caveat in 4a first:
+Set `enforce = true` in `guardian.toml`, then restart:
 
 ```bash
 screen -S guardian -X quit; screen -dmS guardian deploy/run.sh
 ```
 
+Quitting the session first lets the trap remove the old chains cleanly. Under
+systemd it is `sudo systemctl restart pstnhub-guardian`.
+
+Before you do this, make sure the root crontab backstop from step 4 is in place —
+from here on, a hard kill can leave drop rules behind.
+
 Confirm the log says enforcing, the backfill found your players, and the chain is
 really in the kernel:
 
 ```bash
-journalctl -u pstnhub-guardian -n 50          # "Enforce mode active", backfill count
+screen -r guardian                            # "Enforce mode active", backfill count
 sudo nft list ruleset | grep -A15 'table inet squad_main'
 ```
 
@@ -306,6 +304,38 @@ sudo nft delete chain inet squad_main input
 
 Then set `enforce = false` and restart. One line per table if you run several
 servers.
+
+---
+
+## Running under systemd instead
+
+Optional. Worth it if you want the daemon supervised rather than trusted to stay
+up in a screen window.
+
+```bash
+sudo cp deploy/pstnhub-guardian.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pstnhub-guardian
+```
+
+If your checkout is not at `/home/user/squad/PSTN/git/pstnhub-guardian`, edit the
+paths in the unit first — systemd cannot derive them.
+
+What it adds over screen:
+
+- `CAP_NET_ADMIN` granted by the unit, so no `setcap` after every rebuild and no
+  root.
+- `WatchdogSec=30` + `Restart=always` catches a *wedged* daemon — one that is
+  still running but no longer following the log. Nothing in the screen setup can
+  notice that.
+- `ExecStopPost` flushes the gating chains even on SIGKILL/OOM, replacing the
+  root crontab backstop. **One line per server** — adding a `[[server]]` means
+  adding its table there too.
+- `ProtectSystem`, `RestrictAddressFamilies`, dedicated service user.
+
+Do not run both. They would fight over the same nftables tables. Coming from
+screen, quit that session first (`screen -S guardian -X quit`) so its trap removes
+the chains cleanly.
 
 ---
 
