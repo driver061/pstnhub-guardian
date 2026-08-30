@@ -74,6 +74,7 @@ func (t *Tailer) Follow(ctx context.Context, out chan<- string) error {
 	var (
 		curPath string
 		stopCur = func() {}   // stops the follower we are currently running
+		done    chan struct{} // closed when the current follower exits on its own
 		whence  = os.SEEK_END // first file only
 	)
 	defer func() { stopCur() }()
@@ -82,15 +83,35 @@ func (t *Tailer) Follow(ctx context.Context, out chan<- string) error {
 	defer poll.Stop()
 
 	for {
-		if next := t.newest(curPath); next != "" && next != curPath {
+		next := t.newest(curPath)
+
+		// A follower can exit by itself — TailFile failing, the file going away
+		// mid-read. The path has not changed, so the switch below would never fire
+		// and the daemon would sit here healthy, heartbeating, and deaf. Forget the
+		// current file so the switch re-adopts it.
+		//
+		// Restarting reads from END, not START: we already consumed this file's
+		// earlier content, and replaying it re-allows IPs that left hours ago.
+		if done != nil {
+			select {
+			case <-done:
+				curPath, whence, done = "", os.SEEK_END, nil
+				next = t.newest("")
+			default:
+			}
+		}
+
+		if next != "" && next != curPath {
 			stopCur()
 			fctx, cancel := context.WithCancel(ctx)
+			exited := make(chan struct{})
 			stopCur = cancel
 			go func(path string, whence int) {
+				defer close(exited)
 				defer cancel()
 				t.follow1(fctx, path, whence, out)
 			}(next, whence)
-			curPath, whence = next, os.SEEK_SET
+			curPath, whence, done = next, os.SEEK_SET, exited
 		}
 		select {
 		case <-ctx.Done():

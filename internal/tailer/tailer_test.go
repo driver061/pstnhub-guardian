@@ -100,8 +100,8 @@ func TestNewestIgnoresRotatedAndCRCLogs(t *testing.T) {
 
 	old := time.Now().Add(-time.Minute)
 	for name, mod := range map[string]time.Time{
-		"SquadGame.log":                                old,
-		"SquadGame_2.log":                              old,
+		"SquadGame.log":   old,
+		"SquadGame_2.log": old,
 		"SquadGame-backup-2026.08.30-13.00.36.log":     time.Now(),
 		"SquadGame-CRC.log":                            time.Now(),
 		"SquadGame-CRC-backup-2026.08.30-12.56.07.log": time.Now(),

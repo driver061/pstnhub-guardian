@@ -22,11 +22,11 @@ import (
 )
 
 type Gate struct {
-	fw       *firewall.Firewall
-	notif    *notifier.Notifier
-	log      *slog.Logger
-	enforce  bool
-	ttl      time.Duration
+	fw      *firewall.Firewall
+	notif   *notifier.Notifier
+	log     *slog.Logger
+	enforce bool
+	ttl     time.Duration
 
 	mu      sync.Mutex
 	allowed map[netip.Addr]time.Time // in-memory mirror, value = expiry
@@ -79,17 +79,33 @@ func (g *Gate) Snapshot() map[netip.Addr]time.Time {
 func (g *Gate) Handle(ev parser.Event) {
 	switch ev.Kind {
 	case parser.KindBeaconAuthed:
-		g.allow(ev.IP, ev.EOSID)
+		g.allow(ev.IP, ev.EOSID, ev.At)
 	case parser.KindGameAccepted:
 		g.checkGame(ev.IP)
 	}
 }
 
-func (g *Gate) allow(ip netip.Addr, eos string) {
+// allow puts ip on the allow-list until at+ttl. at is the moment the beacon
+// actually completed: time.Now() for a live line, an age-corrected clock time
+// for one replayed by Backfill (zero means "now"). Backfilled and live events
+// race by design, so the later expiry always wins — a replayed line from ten
+// minutes ago must never shorten an allow just granted.
+func (g *Gate) allow(ip netip.Addr, eos string, at time.Time) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	exp := at.Add(g.ttl)
+
 	g.mu.Lock()
-	g.allowed[ip] = time.Now().Add(g.ttl)
+	if cur, ok := g.allowed[ip]; !ok || exp.After(cur) {
+		g.allowed[ip] = exp
+	}
 	g.mu.Unlock()
 
+	// ponytail: the kernel set gets the full TTL, not the remaining one, so a
+	// backfilled IP sits in nftables a little longer than in the mirror. Harmless
+	// (it only ever over-allows an IP that did authenticate); switch to a
+	// per-element timeout if that slack ever matters.
 	if err := g.fw.Allow(ip); err != nil {
 		g.log.Error("allow failed", "ip", ip, "err", err)
 		// An allow failure in enforce mode means a legitimate player may be

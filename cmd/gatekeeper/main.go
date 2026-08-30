@@ -130,11 +130,33 @@ func run(cfg *config.Config, log *slog.Logger) error {
 
 	// --- main loop: tail -> parse -> gate -------------------------------------
 	lines := make(chan string, 1024)
+	tl := tailer.New(cfg.LogPath)
 	go func() {
-		if err := tailer.New(cfg.LogPath).Follow(ctx, lines); err != nil && ctx.Err() == nil {
+		if err := tl.Follow(ctx, lines); err != nil && ctx.Err() == nil {
 			log.Error("tailer stopped", "err", err)
 			stop() // treat a dead tailer as fatal -> triggers fail-open
 		}
+	}()
+
+	// --- startup backfill -----------------------------------------------------
+	// The tailer opens at END, so without this every player already connected
+	// looks unauthenticated — and in enforce mode gets dropped on restart, which
+	// is precisely when the server has just crashed with a full player list.
+	// Replaying the live log's beacon lines rebuilds the allow-list for them.
+	//
+	// Runs CONCURRENTLY with the tail above: it must not delay Follow reaching
+	// SEEK_END, or real-time lines are lost while we scan 35MB. Ordering between
+	// the two is irrelevant — allow() keeps the later expiry either way.
+	go func() {
+		evs, err := tl.Backfill(cfg.AllowTTL)
+		if err != nil {
+			log.Warn("startup backfill failed; allow-list starts from persisted state only", "err", err)
+			return
+		}
+		for _, ev := range evs {
+			g.Handle(ev)
+		}
+		log.Info("startup backfill complete", "allowed_from_log", len(evs))
 	}()
 
 	for {
