@@ -191,6 +191,24 @@ func (f *Firewall) acceptGameIfAllowed(chain *nftables.Chain) {
 			SetName:        f.cfg.Set,
 			SetID:          f.set.ID,
 		},
+		// Refresh the entry's timeout on every accepted packet:
+		//
+		//	update @allowed { ip saddr timeout <AllowTTL> }
+		//
+		// This is what makes AllowTTL an IDLE timeout instead of a session cap.
+		// Without it the kernel expires the entry AllowTTL after the beacon
+		// handshake regardless of what the player is doing, the next packet stops
+		// matching @allowed, and someone six hours into a round is dropped
+		// mid-game with nothing to put them back until they reconnect.
+		//
+		// The beacon happens once, at join, so nothing else would ever re-add them.
+		&expr.Dynset{
+			SrcRegKey: 1, // ip saddr, already loaded above
+			SetName:   f.cfg.Set,
+			SetID:     f.set.ID,
+			Operation: unix.NFT_DYNSET_OP_UPDATE,
+			Timeout:   f.cfg.AllowTTL,
+		},
 		&expr.Verdict{Kind: expr.VerdictAccept},
 	)
 	f.conn.AddRule(&nftables.Rule{Table: f.table, Chain: chain, Exprs: exprs})

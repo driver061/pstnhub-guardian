@@ -21,9 +21,13 @@
 # can opt IN while this is false.
 enforce = false
 
-# How long an authenticated IP stays allowed. The kernel expires set entries, so
-# this is not a timer the daemon has to get right. A player who idles longer than
-# this without re-beaconing is re-checked on their next connection.
+# IDLE timeout: how long an allowed IP stays allowed with NO traffic on the game
+# port. Every accepted packet refreshes it, so a player in a 12-hour session is
+# never dropped — only someone who has actually stopped playing for this long
+# ages out, and they re-beacon on their next join anyway.
+#
+# It is NOT a session cap. Without the refresh this would kick everyone an hour
+# after they joined, since the beacon handshake happens once, at join.
 allow_ttl = "60m"
 
 # Per-source alert aggregation. The first drop from an IP alerts immediately,

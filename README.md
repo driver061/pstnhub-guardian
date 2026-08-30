@@ -69,6 +69,14 @@ The IP is added to an nftables set with a kernel-managed timeout (`allow_ttl`,
 default 60m). The kernel expires entries, so there is no timer for the daemon to
 get wrong.
 
+`allow_ttl` is an **idle** timeout, not a session cap. Every accepted packet
+refreshes the entry (`update @allowed { ip saddr timeout ... }` on the accept
+rule), so a player in a twelve-hour session never ages out. Only someone who has
+genuinely stopped sending traffic for that long expires — and they re-beacon on
+their next join. Without that refresh the set entry would expire an hour after
+the beacon regardless of activity, and everyone would be dropped mid-game, since
+the handshake happens once at join and nothing would re-add them.
+
 ### What the firewall actually installs
 
 Per server, one table containing one set and one chain:
@@ -82,7 +90,8 @@ table inet squad_main {
 
         udp dport 15000 accept                      # beacon: never gated
         udp dport 27165 accept                      # query:  never gated
-        udp dport 7787 ip saddr @allowed accept     # game:   allowed players
+        # game: allowed players, and the match refreshes their idle timeout
+        udp dport 7787 ip saddr @allowed update @allowed { ip saddr timeout 60m } accept
         udp dport 7787 limit rate 10/second log prefix "pstnhub-guardian drop: "
         udp dport 7787 counter drop                 # game:   everyone else
     }
@@ -350,7 +359,7 @@ visible in `ps` to every user on the box.
 | Key | Default | What it does |
 |---|---|---|
 | `enforce` | `false` | Master switch. `false` = log-only, nothing is ever dropped. This is the panic button: setting it false reverts every server at once. |
-| `allow_ttl` | `"60m"` | How long an authenticated IP stays allowed. Kernel-managed. |
+| `allow_ttl` | `"60m"` | **Idle** timeout for an allowed IP. Refreshed by every accepted packet, so it never cuts off an active player; only real inactivity ages an entry out. |
 | `notify_cooldown` | `"5m"` | Per-source Discord aggregation window. |
 | `heartbeat_interval` | `"10s"` | systemd watchdog ping. Keep well under `WatchdogSec` (30s). |
 | `state_dir` | `"state"` | Where per-server allow-lists persist. |
