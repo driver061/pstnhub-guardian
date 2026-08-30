@@ -167,7 +167,7 @@ alert. Guardian recovers the two halves separately:
 ### 1. Build
 
 ```bash
-cd /home/user/squad/PSTN/git/pstnhub-guardian
+cd /home/user/git/pstnhub-guardian
 GOOS=linux GOARCH=amd64 go build -o pstnhub-guardian ./cmd/pstnhub-guardian
 ```
 
@@ -187,8 +187,8 @@ not by running as root.
 
 ```bash
 cp deploy/example.toml guardian.toml
-cp deploy/example.env  guardian.env
-chmod 600 guardian.env
+cp deploy/example.env  .env
+chmod 600 .env
 ```
 
 Fill in the webhook in `guardian.env`, and the log paths and ports in
