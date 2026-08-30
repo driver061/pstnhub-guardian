@@ -200,7 +200,40 @@ ss -ulpn | grep SquadGame
 
 Leave `enforce = false` for now. See the [config guide](#config-guide).
 
-### 4. Install the unit
+### 4. Run it
+
+Two ways. **4a** is quicker to get going and fine for the log-only week; **4b**
+is what you want before enforcing. Pick one — do not run both, they would fight
+over the same nftables tables.
+
+#### 4a. Under screen
+
+Log-only never installs a chain, so there is nothing to fail open and nothing to
+leave behind if this dies.
+
+```bash
+sudo setcap cap_net_admin+ep pstnhub-guardian
+screen -dmS guardian deploy/run.sh
+screen -r guardian      # watch it;  Ctrl-A D to detach
+```
+
+`run.sh` finds `guardian.toml`, `guardian.env` and the binary relative to its own
+location, so a moved checkout still works. Its EXIT trap removes every gating
+chain on Ctrl-C, a crash, or the window closing — it reads the table names out of
+your config, so it stays correct as you add servers.
+
+Two caveats:
+
+- `setcap` is wiped by every rebuild. Re-run it after each `go build`.
+- The trap **cannot** run on SIGKILL, OOM, or power loss. Harmless in log-only.
+  In enforce mode it means drop rules outliving the daemon and players locked out
+  until someone runs `nft delete chain inet squad_main input`. Use 4b to enforce,
+  or put that command in root's crontab as `@reboot`.
+
+If `deploy/run.sh: Permission denied`, the executable bit did not survive the
+checkout: `chmod +x deploy/run.sh`, or run it as `sh deploy/run.sh`.
+
+#### 4b. Under systemd (recommended, required for enforce)
 
 ```bash
 sudo cp deploy/pstnhub-guardian.service /etc/systemd/system/
@@ -211,6 +244,18 @@ sudo systemctl enable --now pstnhub-guardian
 If your checkout is not at `/home/user/squad/PSTN/git/pstnhub-guardian`, edit the
 paths in the unit first — systemd cannot derive them.
 
+This is the supervised path, and it is what makes enforce mode safe:
+
+- `CAP_NET_ADMIN` is granted by the unit, so no `setcap` and no root.
+- `WatchdogSec=30` + `Restart=always` catches a wedged daemon; `run.sh` cannot.
+- `ExecStopPost` flushes the gating chains even on SIGKILL/OOM, where process
+  defers never run. **One line per server** — adding a `[[server]]` means adding
+  its table there too.
+- `ProtectSystem`, `RestrictAddressFamilies` and a dedicated service user.
+
+Coming from 4a, stop the screen session first (`screen -S guardian -X quit`) so
+its trap removes the chains cleanly.
+
 ### 5. Validate in log-only mode
 
 Run for **at least a week** and watch what it would have dropped:
@@ -219,6 +264,8 @@ Run for **at least a week** and watch what it would have dropped:
 journalctl -u pstnhub-guardian -f | grep 'WOULD DROP'
 ```
 
+Under screen (4a) the daemon logs to the terminal instead: `screen -r guardian`.
+
 Every line should be the attacker or obvious garbage. If a real player appears —
 the CGNAT or cached-direct-connect case, roughly 0.2% in our data — investigate
 before enforcing. This week is the whole point: it is how you find out whether
@@ -226,13 +273,20 @@ your player base has anyone the beacon-first assumption does not hold for.
 
 ### 6. Enforce
 
-Set `enforce = true` in `guardian.toml`, then:
+Set `enforce = true` in `guardian.toml`, then restart. Under systemd (4b):
 
 ```bash
 sudo systemctl restart pstnhub-guardian
 ```
 
-Confirm all three:
+Under screen (4a) — but read the SIGKILL caveat in 4a first:
+
+```bash
+screen -S guardian -X quit; screen -dmS guardian deploy/run.sh
+```
+
+Confirm the log says enforcing, the backfill found your players, and the chain is
+really in the kernel:
 
 ```bash
 journalctl -u pstnhub-guardian -n 50          # "Enforce mode active", backfill count
@@ -252,20 +306,6 @@ sudo nft delete chain inet squad_main input
 
 Then set `enforce = false` and restart. One line per table if you run several
 servers.
-
-### Running under screen instead
-
-Fine for the log-only week — log-only never installs a chain, so there is nothing
-to fail open.
-
-```bash
-sudo setcap cap_net_admin+ep pstnhub-guardian
-screen -dmS guardian deploy/run.sh
-```
-
-`setcap` is wiped by every rebuild; re-run it after each `go build`. Do not use
-this for enforce mode: there is no watchdog, and a SIGKILL leaves the drop rules
-in place. Use systemd.
 
 ---
 
